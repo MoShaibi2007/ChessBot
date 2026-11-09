@@ -1,0 +1,163 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import os
+import aiohttp
+
+class ChessBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("Slash commands synced successfully!")
+
+bot = ChessBot()
+
+DB_FILE = 'users.json'
+
+def load_data():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_data(data):
+    with open(DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+async def fetch_chess_stats(username):
+    url = f"https://api.chess.com/pub/player/{username.lower()}/stats"
+    headers = {'User-Agent': 'DiscordBot/1.0'}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                return await response.json()
+            return None
+
+@bot.event
+async def on_ready():
+    print(f'Logged in successfully as: {bot.user.name}')
+
+# 1. Slash Command: /link (Admins/Mods only)
+@bot.tree.command(name="link", description="Link a member's Discord account to a Chess.com username (Admins/Mods only)")
+@app_commands.describe(member="The Discord member to link", chess_username="The exact Chess.com username")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def link_account(interaction: discord.Interaction, member: discord.Member, chess_username: str):
+    await interaction.response.defer()
+
+    stats = await fetch_chess_stats(chess_username)
+    if stats is None:
+        embed = discord.Embed(
+            title="❌ Account Not Found",
+            description=f"The username **{chess_username}** was not found on Chess.com.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    data = load_data()
+    data[str(member.id)] = chess_username
+    save_data(data)
+    
+    embed = discord.Embed(
+        title="✅ Account Linked Successfully",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Discord Member", value=member.mention, inline=True)
+    embed.add_field(name="Chess.com Username", value=f"`{chess_username}`", inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    
+    await interaction.followup.send(embed=embed)
+
+@link_account.error
+async def link_account_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You do not have permission to use this command. Only Mods/Admins can link accounts.", ephemeral=True)
+
+# 2. Slash Command: /profile [member]
+@bot.tree.command(name="profile", description="View the linked Chess.com username for yourself or another member")
+@app_commands.describe(member="Select a member to view their profile (optional)")
+async def profile(interaction: discord.Interaction, member: discord.Member = None):
+    target_member = member or interaction.user
+    data = load_data()
+    user_id = str(target_member.id)
+    
+    if user_id not in data:
+        await interaction.response.send_message(f"❌ **{target_member.display_name}** has not linked a Chess.com account yet.", ephemeral=True)
+        return
+    
+    chess_username = data[user_id]
+    
+    embed = discord.Embed(
+        title=f"♟️ Chess.com Profile — {target_member.display_name}",
+        url=f"https://www.chess.com/member/{chess_username}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Username", value=f"`{chess_username}`", inline=False)
+    embed.set_thumbnail(url=target_member.display_avatar.url)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 3. Slash Command: /elo [member]
+@bot.tree.command(name="elo", description="Get Chess.com stats and average rating for yourself or another member")
+@app_commands.describe(member="Select a member to view their stats (optional)")
+async def get_elo(interaction: discord.Interaction, member: discord.Member = None):
+    await interaction.response.defer()
+
+    target_member = member or interaction.user
+    data = load_data()
+    user_id = str(target_member.id)
+    
+    if user_id not in data:
+        embed = discord.Embed(
+            title="❌ Account Not Linked",
+            description=f"**{target_member.display_name}** does not have a linked Chess.com account yet.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    chess_username = data[user_id]
+    stats = await fetch_chess_stats(chess_username)
+    
+    if not stats:
+        embed = discord.Embed(
+            title="⚠️ API Error",
+            description=f"Could not retrieve stats for **{chess_username}** at this moment.",
+            color=discord.Color.orange()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    rapid = stats.get('chess_rapid', {}).get('last', {}).get('rating', None)
+    blitz = stats.get('chess_blitz', {}).get('last', {}).get('rating', None)
+    bullet = stats.get('chess_bullet', {}).get('last', {}).get('rating', None)
+
+    active_ratings = [r for r in [rapid, blitz, bullet] if r is not None]
+    avg_rating = int(sum(active_ratings) / len(active_ratings)) if active_ratings else 'N/A'
+
+    rapid_str = str(rapid) if rapid is not None else 'Unrated'
+    blitz_str = str(blitz) if blitz is not None else 'Unrated'
+    bullet_str = str(bullet) if bullet is not None else 'Unrated'
+
+    embed = discord.Embed(
+        title=f"♟️ Chess.com Stats — {target_member.display_name}",
+        url=f"https://www.chess.com/member/{chess_username}",
+        color=discord.Color.gold()
+    )
+    embed.set_thumbnail(url=target_member.display_avatar.url)
+    embed.add_field(name="Username", value=f"`{chess_username}`", inline=False)
+    embed.add_field(name="⏱️ Rapid", value=f"`{rapid_str}`", inline=True)
+    embed.add_field(name="⚡ Blitz", value=f"`{blitz_str}`", inline=True)
+    embed.add_field(name="🚀 Bullet", value=f"`{bullet_str}`", inline=True)
+    embed.add_field(name="📊 Average ELO", value=f"`{avg_rating}`", inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+BOT_TOKEN = os.getenv('DISCORD_TOKEN')
+
+bot.run(BOT_TOKEN)
